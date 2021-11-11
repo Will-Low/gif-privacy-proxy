@@ -8,6 +8,8 @@ use tokio_rustls::rustls;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
+const PERMITTED_DESTINATIONS: &[&str] = &["api.giphy.com:443"];
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let proxy_options = parse_cli();
@@ -15,7 +17,7 @@ async fn main() -> io::Result<()> {
 
     let tls_acceptor = TlsAcceptor::from(tls_config.await);
     let listening_addr = format!("{}:{}", proxy_options.bind_address, proxy_options.bind_port);
-    let listener = TcpListener::bind(listening_addr).await.unwrap();
+    let listener = TcpListener::bind(listening_addr).await?;
 
     loop {
         let (client_stream, _) = listener.accept().await.unwrap();
@@ -23,22 +25,22 @@ async fn main() -> io::Result<()> {
             establish_tls(client_stream, &tls_acceptor).await;
         let http_request = parse_http_request(&mut client_stream).await;
         if !is_http_connect(&http_request).await {
-            client_stream
-                .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
-                .await
-                .unwrap();
-            client_stream.flush().await.unwrap();
+            send_unsupported_method_status(&mut client_stream).await?;
+            continue;
+        }
+        if !is_permitted_url(&http_request.uri).await {
+            send_forbidden_error(&mut client_stream).await?;
             continue;
         }
         let mut dst_stream = TcpStream::connect(http_request.uri).await.unwrap();
-        client_stream
-            .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
-            .await
-            .unwrap();
+        send_ok_status(&mut client_stream).await?;
         client_stream.flush().await.unwrap();
-        io::copy_bidirectional(&mut client_stream, &mut dst_stream)
+        if io::copy_bidirectional(&mut client_stream, &mut dst_stream)
             .await
-            .unwrap();
+            .is_err()
+        {
+            continue;
+        }
     }
 }
 
@@ -96,7 +98,7 @@ fn load_private_key(filepath: &str) -> rustls::PrivateKey {
 }
 
 async fn build_tls_config(proxy_options: &ProxyOptions) -> Arc<rustls::ServerConfig> {
-    let mut config = rustls::ServerConfig::builder()
+    let config = rustls::ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(
@@ -137,18 +139,34 @@ async fn is_http_connect(req: &HttpRequest) -> bool {
     false
 }
 
-/// Check both domain + path, in the event the domain has an endpoint with an open redirect
-const PERMITTED_URLS: &'static [&str] = &["api.giphy.com/v1/gifs/search"];
-
-fn is_permitted_url(url: &str) -> bool {
-    PERMITTED_URLS.contains(&url)
+async fn is_permitted_url(url: &str) -> bool {
+    PERMITTED_DESTINATIONS.contains(&url)
 }
 
-fn send_unsupported_method_error(stream: &mut TlsStream<TcpStream>) -> io::Result<()> {
-    stream
-        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
-        .unwrap();
-    stream.flush().unwrap();
+async fn send_unsupported_method_status(stream: &mut TlsStream<TcpStream>) -> io::Result<()> {
+    send_http_status(stream, 405, "Method Not Allowed").await?;
+    Ok(())
+}
+
+async fn send_forbidden_error(stream: &mut TlsStream<TcpStream>) -> io::Result<()> {
+    send_http_status(stream, 403, "Forbidden").await?;
+    Ok(())
+}
+
+async fn send_ok_status(stream: &mut TlsStream<TcpStream>) -> io::Result<()> {
+    send_http_status(stream, 200, "OK").await?;
+    Ok(())
+}
+
+async fn send_http_status(
+    stream: &mut TlsStream<TcpStream>,
+    status_code: u16,
+    status_msg: &str,
+) -> io::Result<()> {
+    let status_line = format!("HTTP/1.1 {} {}\r\n\r\n", status_code, status_msg);
+    stream.write_all(status_line.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]
