@@ -1,132 +1,44 @@
-use async_std::io::{self, BufReader, WriteExt};
-use async_std::net::{TcpListener, TcpStream};
-use async_std::prelude::*;
-use async_tls::TlsAcceptor;
 use clap::{load_yaml, App};
 use std::fs;
+use std::io::BufReader;
 use std::sync::Arc;
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::rustls;
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 
-struct ProxyOptions {
-    bind_address: String,
-    bind_port: String,
-    certs: Vec<rustls::Certificate>,
-    private_key: rustls::PrivateKey,
-}
-
-#[async_std::main]
-async fn main() {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     let proxy_options = parse_cli();
     let tls_config = build_tls_config(&proxy_options);
 
-    let acceptor = TlsAcceptor::from(tls_config.await);
-    let listener = TcpListener::bind(format!(
-        "{}:{}",
-        proxy_options.bind_address, proxy_options.bind_port
-    ))
-    .await
-    .unwrap();
+    let tls_acceptor = TlsAcceptor::from(tls_config.await);
+    let listening_addr = format!("{}:{}", proxy_options.bind_address, proxy_options.bind_port);
+    let listener = TcpListener::bind(listening_addr).await.unwrap();
 
-    while let Some(stream) = listener.incoming().next().await {
-        let acceptor = acceptor.clone();
-        let mut buffer: [u8; 8192] = [0; 8192];
-        let stream = stream.unwrap();
-
-        let handshake = acceptor.accept(&stream);
-
-        let tls_stream = handshake.await;
-        if let Err(_) = tls_stream {
-            continue;
-        }
-
-        let mut tls_stream = tls_stream.unwrap();
-
-        tls_stream.read(&mut buffer).await.unwrap();
-        let mut headers = [httparse::EMPTY_HEADER; 4];
-        let mut req = httparse::Request::new(&mut headers);
-        let result = req.parse(&buffer);
-        if result.is_err() {
-            continue;
-        }
-        if req.method.unwrap() != "CONNECT" {
-            tls_stream
+    loop {
+        let (client_stream, _) = listener.accept().await.unwrap();
+        let mut client_stream: TlsStream<TcpStream> =
+            establish_tls(client_stream, &tls_acceptor).await;
+        let http_request = parse_http_request(&mut client_stream).await;
+        if !is_http_connect(&http_request).await {
+            client_stream
                 .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
                 .await
                 .unwrap();
-            tls_stream.flush().await.unwrap();
+            client_stream.flush().await.unwrap();
             continue;
         }
-
-        // // TODO - verify path
-
-        let mut dst_stream = TcpStream::connect(req.path.unwrap()).await.unwrap();
-        tls_stream
+        let mut dst_stream = TcpStream::connect(http_request.uri).await.unwrap();
+        client_stream
             .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
             .await
             .unwrap();
-        tls_stream.flush().await.unwrap();
-
-        let mut buffer: [u8; 8192] = [0; 8192];
-        loop {
-            let read_size = tls_stream.read(&mut buffer).await.unwrap();
-            // let mut buffer = vec!();
-            //let read_size = read_into_buffer(&mut tls_stream, &mut buffer).await.unwrap();
-
-            println!("{} 93", read_size);
-            let write_size = dst_stream.write(&mut buffer[0..read_size]).await.unwrap();
-            println!("{} 115", write_size);
-            dst_stream.flush().await.unwrap();
-
-            let read_size = dst_stream.read(&mut buffer).await.unwrap();
-            println!("{} 125", read_size);
-            let write_size = tls_stream.write(&mut buffer[0..read_size]).await.unwrap();
-            println!("{} 126", write_size);
-            tls_stream.flush().await.unwrap();
-        }
-    }
-}
-
-async fn read_into_buffer<R>(stream: &mut R, buffer: &mut [u8] ) -> io::Result<usize>
-where
-    R: async_std::io::Read + std::marker::Unpin,
-{
-    let mut cursor = 0;
-    let mut stream_reader = BufReader::new(stream);
-    loop {
-        let mut buffer: [u8; 8192] = [0; 8192];
-        println!("Loop start");
-        let bytes_read = stream_reader.read(&mut buffer).await;
-        println!("{:#?}", bytes_read);
-        println!("{}", cursor);
-        match bytes_read {
-            Ok(0) => return Ok(cursor),
-            Ok(num_bytes) => {
-                println!("{:#?}", bytes_read);
-                cursor += num_bytes;
-            }
-            Err(e) => return io::Result::Err(e),
-        }
-        println!("Loop end");
-    }
-}
-
-async fn build_tls_config(proxy_options: &ProxyOptions) -> Arc<rustls::ServerConfig> {
-    let mut config = rustls::ServerConfig::new(rustls::NoClientAuth::new());
-    config
-        .set_single_cert(
-            proxy_options.certs.clone(),
-            proxy_options.private_key.clone(),
-        )
-        .expect("bad certifcate/key");
-    Arc::new(config)
-}
-
-enum ErrorTypes {
-    IOError(io::Error),
-}
-
-impl From<io::Error> for ErrorTypes {
-    fn from(error: io::Error) -> Self {
-        ErrorTypes::IOError(error)
+        client_stream.flush().await.unwrap();
+        io::copy_bidirectional(&mut client_stream, &mut dst_stream)
+            .await
+            .unwrap();
     }
 }
 
@@ -147,8 +59,15 @@ fn parse_cli() -> ProxyOptions {
     }
 }
 
-fn load_certs(filename: &str) -> Vec<rustls::Certificate> {
-    let certfile = fs::File::open(filename).expect("cannot open certificate file");
+struct ProxyOptions {
+    bind_address: String,
+    bind_port: String,
+    certs: Vec<rustls::Certificate>,
+    private_key: rustls::PrivateKey,
+}
+
+fn load_certs(filepath: &str) -> Vec<rustls::Certificate> {
+    let certfile = fs::File::open(filepath).expect("cannot open certificate file");
     let mut reader = BufReader::new(certfile);
     rustls_pemfile::certs(&mut reader)
         .unwrap()
@@ -157,8 +76,8 @@ fn load_certs(filename: &str) -> Vec<rustls::Certificate> {
         .collect()
 }
 
-fn load_private_key(filename: &str) -> rustls::PrivateKey {
-    let keyfile = fs::File::open(filename).expect("cannot open private key file");
+fn load_private_key(filepath: &str) -> rustls::PrivateKey {
+    let keyfile = fs::File::open(filepath).expect("cannot open private key file");
     let mut reader = BufReader::new(keyfile);
 
     loop {
@@ -172,8 +91,50 @@ fn load_private_key(filename: &str) -> rustls::PrivateKey {
 
     panic!(
         "no keys found in {:?} (encrypted keys not supported)",
-        filename
+        filepath
     );
+}
+
+async fn build_tls_config(proxy_options: &ProxyOptions) -> Arc<rustls::ServerConfig> {
+    let mut config = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(
+            proxy_options.certs.clone(),
+            proxy_options.private_key.clone(),
+        )
+        .expect("Unable to create TLS config");
+    Arc::new(config)
+}
+
+async fn establish_tls(stream: TcpStream, acceptor: &TlsAcceptor) -> TlsStream<TcpStream> {
+    let acceptor = acceptor.clone();
+    acceptor
+        .accept(stream)
+        .await
+        .expect("Unable to establish TLS with client")
+}
+
+async fn parse_http_request(client_stream: &mut TlsStream<TcpStream>) -> HttpRequest {
+    let mut buffer: [u8; 512] = [0; 512];
+    client_stream.read(&mut buffer).await.unwrap();
+    let req = std::str::from_utf8(&buffer).unwrap();
+    let req = req.split(' ').collect::<Vec<&str>>();
+    let method = req[0].to_string();
+    let uri = req[1].to_string();
+    HttpRequest { method, uri }
+}
+
+struct HttpRequest {
+    method: String,
+    uri: String,
+}
+
+async fn is_http_connect(req: &HttpRequest) -> bool {
+    if req.method == "CONNECT" {
+        return true;
+    }
+    false
 }
 
 /// Check both domain + path, in the event the domain has an endpoint with an open redirect
@@ -183,9 +144,12 @@ fn is_permitted_url(url: &str) -> bool {
     PERMITTED_URLS.contains(&url)
 }
 
-// fn is_http_connect(req: Vec<u8>) -> bool {
-
-// }
+fn send_unsupported_method_error(stream: &mut TlsStream<TcpStream>) -> io::Result<()> {
+    stream
+        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+        .unwrap();
+    stream.flush().unwrap();
+}
 
 #[cfg(test)]
 mod tests {
