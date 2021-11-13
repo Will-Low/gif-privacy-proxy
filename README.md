@@ -19,6 +19,7 @@ curl --proxy-insecure -x https://127.0.0.1:8080  "https://api.giphy.com/v1/gifs/
 ```
 
 _Note that `--proxy-insecure` is needed if using a self-signed certificate._
+_Assumes binding to 127.0.0.1:8080._
 
 ## Load Testing
 Load testing was done using `jmeter` and was loaded from the following `curl` command:
