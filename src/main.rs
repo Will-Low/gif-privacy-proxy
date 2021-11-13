@@ -8,7 +8,8 @@ use tokio_rustls::rustls;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
-const PERMITTED_DESTINATIONS: &[&str] = &["api.giphy.com:443"];
+// TODO - Remove
+const PERMITTED_DESTINATIONS: &[&str] = &["api.giphy.com:443", "api.giphy.com", "https://api.giphy.com/v1/gifs/search"];
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -18,30 +19,8 @@ async fn main() -> io::Result<()> {
     let tls_acceptor = TlsAcceptor::from(tls_config.await);
     let listening_addr = format!("{}:{}", proxy_options.bind_address, proxy_options.bind_port);
     let listener = TcpListener::bind(listening_addr).await?;
-
-    loop {
-        let (client_stream, _) = listener.accept().await.unwrap();
-        let mut client_stream: TlsStream<TcpStream> =
-            establish_tls(client_stream, &tls_acceptor).await;
-        let http_request = parse_http_request(&mut client_stream).await;
-        if !is_http_connect(&http_request).await {
-            send_unsupported_method_status(&mut client_stream).await?;
-            continue;
-        }
-        if !is_permitted_url(&http_request.uri).await {
-            send_forbidden_error(&mut client_stream).await?;
-            continue;
-        }
-        let mut dst_stream = TcpStream::connect(http_request.uri).await.unwrap();
-        send_ok_status(&mut client_stream).await?;
-        client_stream.flush().await.unwrap();
-        if io::copy_bidirectional(&mut client_stream, &mut dst_stream)
-            .await
-            .is_err()
-        {
-            continue;
-        }
-    }
+    run_server(listener, tls_acceptor).await;
+    Ok(())
 }
 
 fn parse_cli() -> ProxyOptions {
@@ -109,22 +88,78 @@ async fn build_tls_config(proxy_options: &ProxyOptions) -> Arc<rustls::ServerCon
     Arc::new(config)
 }
 
-async fn establish_tls(stream: TcpStream, acceptor: &TlsAcceptor) -> TlsStream<TcpStream> {
-    let acceptor = acceptor.clone();
-    acceptor
-        .accept(stream)
-        .await
-        .expect("Unable to establish TLS with client")
+async fn run_server(listener: TcpListener, tls_acceptor: TlsAcceptor) {
+    loop {
+        let (client_stream, _) = match listener.accept().await {
+            Ok(stream) => stream,
+            Err(_) => continue,
+        };
+
+        let mut client_stream_tls = match establish_tls(client_stream, &tls_acceptor).await {
+            Ok(stream) => stream,
+            Err(_) => continue,
+        };
+
+        let rcvd_http_request = match parse_http_request(&mut client_stream_tls).await {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+
+        if !is_http_connect(&rcvd_http_request).await {
+            if let Err(_) = send_unsupported_method_status(&mut client_stream_tls).await {
+                continue;
+            }
+            continue;
+        }
+
+        if !is_permitted_destination(&rcvd_http_request.uri).await {
+            if let Err(_) = send_forbidden_status(&mut client_stream_tls).await {
+                continue;
+            }
+            continue;
+        }
+
+        let mut dst_stream = match TcpStream::connect(rcvd_http_request.uri).await {
+            Ok(stream) => stream,
+            Err(_) => continue,
+        };
+
+        if let Err(_) = send_ok_status(&mut client_stream_tls).await {
+            continue;
+        }
+
+        client_stream_tls.flush().await.unwrap();
+        if io::copy_bidirectional(&mut client_stream_tls, &mut dst_stream)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        client_stream_tls.shutdown().await.unwrap();
+    }
 }
 
-async fn parse_http_request(client_stream: &mut TlsStream<TcpStream>) -> HttpRequest {
+async fn establish_tls(
+    stream: TcpStream,
+    acceptor: &TlsAcceptor,
+) -> Result<TlsStream<TcpStream>, std::io::Error> {
+    let acceptor = acceptor.clone();
+    acceptor.accept(stream).await
+}
+
+async fn parse_http_request(
+    client_stream: &mut TlsStream<TcpStream>,
+) -> Result<HttpRequest, Box<dyn std::error::Error>> {
     let mut buffer: [u8; 512] = [0; 512];
-    client_stream.read(&mut buffer).await.unwrap();
-    let req = std::str::from_utf8(&buffer).unwrap();
+    client_stream.read(&mut buffer).await?;
+    let req = match std::str::from_utf8(&buffer) {
+        Ok(r) => r,
+        Err(e) => return Err(Box::new(e)),
+    };
     let req = req.split(' ').collect::<Vec<&str>>();
     let method = req[0].to_string();
     let uri = req[1].to_string();
-    HttpRequest { method, uri }
+    Ok(HttpRequest { method, uri })
 }
 
 struct HttpRequest {
@@ -139,34 +174,36 @@ async fn is_http_connect(req: &HttpRequest) -> bool {
     false
 }
 
-async fn is_permitted_url(url: &str) -> bool {
+async fn is_permitted_destination(url: &str) -> bool {
     PERMITTED_DESTINATIONS.contains(&url)
 }
 
 async fn send_unsupported_method_status(stream: &mut TlsStream<TcpStream>) -> io::Result<()> {
-    send_http_status(stream, 405, "Method Not Allowed").await?;
+    let status_msg = create_http_status(405, "Method Not Allowed").await;
+    send_http_status(stream, &status_msg).await?;
     Ok(())
 }
 
-async fn send_forbidden_error(stream: &mut TlsStream<TcpStream>) -> io::Result<()> {
-    send_http_status(stream, 403, "Forbidden").await?;
+async fn send_forbidden_status(stream: &mut TlsStream<TcpStream>) -> io::Result<()> {
+    let status_msg = create_http_status(403, "Forbidden Yeah").await;
+    send_http_status(stream, &status_msg).await?;
     Ok(())
 }
 
 async fn send_ok_status(stream: &mut TlsStream<TcpStream>) -> io::Result<()> {
-    send_http_status(stream, 200, "OK").await?;
+    let status_msg = create_http_status(200, "OK").await;
+    send_http_status(stream, &status_msg).await?;
     Ok(())
 }
 
-async fn send_http_status(
-    stream: &mut TlsStream<TcpStream>,
-    status_code: u16,
-    status_msg: &str,
-) -> io::Result<()> {
-    let status_line = format!("HTTP/1.1 {} {}\r\n\r\n", status_code, status_msg);
-    stream.write_all(status_line.as_bytes()).await?;
+async fn send_http_status(stream: &mut TlsStream<TcpStream>, status_msg: &str) -> io::Result<()> {
+    stream.write_all(status_msg.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+async fn create_http_status(status_code: u16, status_message: &str) -> String {
+    format!("HTTP/1.1 {} {}\r\n\r\n", status_code, status_message)
 }
 
 #[cfg(test)]
@@ -178,25 +215,48 @@ mod tests {
         expected: E,
     }
 
-    #[test]
-    fn test_is_permitted_url() {
+    #[tokio::test]
+    async fn test_is_permitted_destination() {
         let cases = vec![
             TestCase {
-                input: "api.giphy.com/v1/gifs/search",
+                input: "api.giphy.com:443",
                 expected: true,
             },
             TestCase {
-                input: "api.giphy.com/v1/gifs/disallowed-endpoint",
+                input: "api.giphy.com:80",
                 expected: false,
             },
             TestCase {
-                input: "different.url.com/v1/gifs/search",
+                input: "different.url.com:443",
                 expected: false,
             },
         ];
 
         for c in cases {
-            assert_eq!(is_permitted_url(&c.input), c.expected);
+            assert_eq!(is_permitted_destination(&c.input).await, c.expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_is_http_connect() {
+        let cases = vec![
+            TestCase {
+                input: HttpRequest {
+                    method: "CONNECT".to_string(),
+                    uri: "api.giphy.com:443".to_string(),
+                },
+                expected: true,
+            },
+            TestCase {
+                input: HttpRequest {
+                    method: "GET".to_string(),
+                    uri: "api.giphy.com:443".to_string(),
+                },
+                expected: false,
+            },
+        ];
+        for c in cases {
+            assert_eq!(is_http_connect(&c.input).await, c.expected);
         }
     }
 }

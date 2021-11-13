@@ -1,19 +1,27 @@
 name: Gif Privacy Proxy
 version: "0.1.0"
 author: Will-Low
-about: A proxy to preserver privacy when looking up GIFs
+about: A proxy to preserve privacy when looking up GIFs
 args:
     - bind-address:
         short: b
         long: bind-address
         value_name: ADDR
-        help: "Address to bind to in the format of ip:port. Defaults to 127.0.0.1:8080."
+        help: "Address to bind to. Defaults to 127.0.0.1."
         takes_value: true
-    # - INPUT:
-    #     help: Sets the input file to use
-    #     required: true
-    #     index: 1
-    # - verbose:
-    #     short: v
-    #     multiple: true
-    #     help: Sets the level of verbosity
+    - bind-port:
+        short: p
+        long: bind-port
+        value_name: PORT
+        help: "Port to bind to. Defaults to 8080"
+        takes_value: true
+    - cert-path:
+        long: cert-path
+        value_name: PATH
+        help: "Path to proxy cert. Defaults to MyCertificate.crt"
+        takes_value: true
+    - key-path:
+        long: key-path
+        value_name: PATH
+        help: "Path to proxy private key. Defaults to MyKey.key"
+        takes_value: true

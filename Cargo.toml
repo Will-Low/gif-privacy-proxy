@@ -6,11 +6,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-std = {version = "1.10.0", features = ["attributes", "unstable"]}
-async-tls = "0.11.0"
 clap = {version = "2.33", features = ["yaml"]}
-futures-lite = "1.0.0"
-httparse = "1.5.1"
 tokio = {version = "1.13.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread"]}
 tokio-rustls = "0.23.1"
 rustls = "0.20.0"
