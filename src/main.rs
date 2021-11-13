@@ -8,8 +8,7 @@ use tokio_rustls::rustls;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
-// TODO - Remove
-const PERMITTED_DESTINATIONS: &[&str] = &["api.giphy.com:443", "api.giphy.com", "https://api.giphy.com/v1/gifs/search"];
+const PERMITTED_DESTINATIONS: &[&str] = &["api.giphy.com:443"];
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -71,7 +70,7 @@ fn load_private_key(filepath: &str) -> rustls::PrivateKey {
     }
 
     panic!(
-        "no keys found in {:?} (encrypted keys not supported)",
+        "no key found in {:?}",
         filepath
     );
 }
@@ -128,14 +127,16 @@ async fn run_server(listener: TcpListener, tls_acceptor: TlsAcceptor) {
             continue;
         }
 
-        client_stream_tls.flush().await.unwrap();
+        if client_stream_tls.flush().await.is_err() {
+            continue;
+        }
+
         if io::copy_bidirectional(&mut client_stream_tls, &mut dst_stream)
             .await
             .is_err()
         {
             continue;
         }
-        client_stream_tls.shutdown().await.unwrap();
     }
 }
 
@@ -259,4 +260,16 @@ mod tests {
             assert_eq!(is_http_connect(&c.input).await, c.expected);
         }
     }
+    
+    // #[tokio::test]
+    // async fn test_parse_http_request() {
+    //     let cases = vec![
+    //         TestCase {
+    //             input: "GET / HTTP/1.1\r\n\r\n",
+
+    //     ];
+    //     for c in cases {
+    //         assert_eq!(is_http_connect(&c.input).await, c.expected);
+    //     }
+    // }
 }
