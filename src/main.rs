@@ -69,10 +69,7 @@ fn load_private_key(filepath: &str) -> rustls::PrivateKey {
         }
     }
 
-    panic!(
-        "no key found in {:?}",
-        filepath
-    );
+    panic!("no key found in {:?}", filepath);
 }
 
 async fn build_tls_config(proxy_options: &ProxyOptions) -> Arc<rustls::ServerConfig> {
@@ -89,55 +86,44 @@ async fn build_tls_config(proxy_options: &ProxyOptions) -> Arc<rustls::ServerCon
 
 async fn run_server(listener: TcpListener, tls_acceptor: TlsAcceptor) {
     loop {
-        let (client_stream, _) = match listener.accept().await {
-            Ok(stream) => stream,
-            Err(_) => continue,
-        };
+        let (client_stream, _) = unwrap_or_continue!(listener.accept().await);
 
-        let mut client_stream_tls = match establish_tls(client_stream, &tls_acceptor).await {
-            Ok(stream) => stream,
-            Err(_) => continue,
-        };
+        let mut client_stream_tls =
+            unwrap_or_continue!(establish_tls(client_stream, &tls_acceptor).await);
 
-        let rcvd_http_request = match parse_http_request(&mut client_stream_tls).await {
-            Ok(request) => request,
-            Err(_) => continue,
-        };
+        let http_request_line =
+            unwrap_or_continue!(read_http_request(&mut client_stream_tls).await);
+
+        let rcvd_http_request = unwrap_or_continue!(parse_http_request(&http_request_line).await);
 
         if !is_http_connect(&rcvd_http_request).await {
-            if let Err(_) = send_unsupported_method_status(&mut client_stream_tls).await {
-                continue;
-            }
+            unwrap_or_continue!(send_unsupported_method_status(&mut client_stream_tls).await);
             continue;
         }
 
         if !is_permitted_destination(&rcvd_http_request.uri).await {
-            if let Err(_) = send_forbidden_status(&mut client_stream_tls).await {
-                continue;
-            }
+            unwrap_or_continue!(send_forbidden_status(&mut client_stream_tls).await);
             continue;
         }
 
-        let mut dst_stream = match TcpStream::connect(rcvd_http_request.uri).await {
-            Ok(stream) => stream,
-            Err(_) => continue,
-        };
+        let mut dst_stream = unwrap_or_continue!(TcpStream::connect(rcvd_http_request.uri).await);
 
-        if let Err(_) = send_ok_status(&mut client_stream_tls).await {
-            continue;
-        }
+        unwrap_or_continue!(send_ok_status(&mut client_stream_tls).await);
 
-        if client_stream_tls.flush().await.is_err() {
-            continue;
-        }
+        unwrap_or_continue!(client_stream_tls.flush().await);
 
-        if io::copy_bidirectional(&mut client_stream_tls, &mut dst_stream)
-            .await
-            .is_err()
-        {
-            continue;
-        }
+        unwrap_or_continue!(io::copy_bidirectional(&mut client_stream_tls, &mut dst_stream).await);
     }
+}
+
+#[macro_export]
+macro_rules! unwrap_or_continue {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(_) => continue,
+        }
+    };
 }
 
 async fn establish_tls(
@@ -148,21 +134,35 @@ async fn establish_tls(
     acceptor.accept(stream).await
 }
 
-async fn parse_http_request(
+async fn read_http_request(
     client_stream: &mut TlsStream<TcpStream>,
-) -> Result<HttpRequest, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut buffer: [u8; 512] = [0; 512];
     client_stream.read(&mut buffer).await?;
-    let req = match std::str::from_utf8(&buffer) {
-        Ok(r) => r,
-        Err(e) => return Err(Box::new(e)),
-    };
+    match std::str::from_utf8(&buffer) {
+        Ok(s) => Ok(s.to_string()),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+async fn parse_http_request(req: &str) -> Result<HttpRequest, Box<dyn std::error::Error>> {
     let req = req.split(' ').collect::<Vec<&str>>();
-    let method = req[0].to_string();
-    let uri = req[1].to_string();
+    let invalid_http_req_err = Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "Invalid HTTP request",
+    ));
+    let method = match req.get(0) {
+        Some(m) => m.to_string(),
+        None => return Err(invalid_http_req_err),
+    };
+    let uri = match req.get(1) {
+        Some(u) => u.to_string(),
+        None => return Err(invalid_http_req_err),
+    };
     Ok(HttpRequest { method, uri })
 }
 
+#[derive(Debug, PartialEq)]
 struct HttpRequest {
     method: String,
     uri: String,
@@ -260,16 +260,72 @@ mod tests {
             assert_eq!(is_http_connect(&c.input).await, c.expected);
         }
     }
-    
-    // #[tokio::test]
-    // async fn test_parse_http_request() {
-    //     let cases = vec![
-    //         TestCase {
-    //             input: "GET / HTTP/1.1\r\n\r\n",
 
-    //     ];
-    //     for c in cases {
-    //         assert_eq!(is_http_connect(&c.input).await, c.expected);
-    //     }
-    // }
+    #[tokio::test]
+    async fn test_parse_http_request_connect_should_pass() {
+        let line = "CONNECT example.com:443 HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            parse_http_request(line).await.unwrap(),
+            HttpRequest {
+                method: "CONNECT".to_string(),
+                uri: "example.com:443".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_get_should_pass() {
+        let line = "GET / HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            parse_http_request(line).await.unwrap(),
+            HttpRequest {
+                method: "GET".to_string(),
+                uri: "/".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_invalid_input_should_pass() {
+        let line = "This is some test text";
+        assert_eq!(
+            parse_http_request(line).await.unwrap(),
+            HttpRequest {
+                method: "This".to_string(),
+                uri: "is".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn test_parse_http_request_invalid_input_should_panic() {
+        let line = "ThisIsSomeTestText";
+        parse_http_request(line).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn test_parse_http_request_no_input_should_panic() {
+        let line = "";
+        parse_http_request(line).await.unwrap();
+    }
+
+    #[test]
+    fn test_unwrap_or_continue_unwraps_when_ok() {
+        loop {
+            let ok: Result<&str, &str> = Ok("ok");
+            assert_eq!(unwrap_or_continue!(ok), "ok");
+            break;
+        }
+    }
+
+    #[test]
+    fn test_unwrap_or_continue_continues_when_err() {
+        for _ in [0] {
+            let err: Result<&str, &str> = Err("err");
+            unwrap_or_continue!(err);
+            panic!(); // Should never reach
+        }
+    }
 }
