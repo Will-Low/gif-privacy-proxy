@@ -3,12 +3,12 @@ A privacy-preserving proxy using HTTP tunneling (HTTP CONNECT) to search for GIF
 
 ## To Run
 ```
-cargo run
+cargo run -- --bind-address <ADDRESS> --bind-port <PORT> --cert-path <PATH TO CERT> --key-path <PATH TO KEY>
 ```
 
 ## To Run with Optimization
 ```
-cargo run --release
+cargo run --release -- --bind-address <ADDRESS> --bind-port <PORT> --cert-path <PATH TO CERT> --key-path <PATH TO KEY>
 ```
 
 ## To Test Connectivity
@@ -33,8 +33,8 @@ The proxy was stable at 100 local threads with a 30-second ramp-up time.
 2. Add a reasonable timeout for stalled connections.
 3. Add retry logic and make error handling logic more transparent. In this initial version, errors terminate the TCP connection with the client, with limited best-effort error notification.
 4. Add failure logging/monitoring, while respecting user privacy.
-5. Identify expected load and load test realistic conditions. Add load-balancing upstream, as appropriate.
-6. Add auto-scaling.
-7. Add DDoS protections.
+5. Identify expected load and load-test realistic conditions. Add load-balancing upstream, as appropriate.
+6. Add auto-scaling, as appropriate.
 8. Add integration tests.
 9. Add basic server throttling.
+10. Refactor to faciliate additional unit testing.
